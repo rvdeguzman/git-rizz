@@ -45,7 +45,8 @@ export default defineConfig({
     // See actions/events/channels:    adk info <integration>
     dependencies: {
         "integrations": {
-            "webchat": "webchat@0.3.0"
+            "webchat": "webchat@0.3.0",
+            "chat": "chat@1.0.0"
         }
     },
 })
