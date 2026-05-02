@@ -33,6 +33,13 @@ export type ChatReply = {
   message: ChatMessage;
   status: ChatStatus;
   source: "botpress" | "local";
+  engine?: "botpress-completion" | "botpress-action-fallback" | "local";
+  completion?: {
+    llmCalls: number;
+    model?: string;
+    tokens?: number;
+    durationMs: number;
+  };
   coaching?: {
     dateScore: number;
     read: string;

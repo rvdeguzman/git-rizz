@@ -15,6 +15,14 @@ type BotpressPayload = {
   history: ChatMessage[];
 };
 
+type BotpressResult = {
+  text: string;
+  status?: ChatStatus;
+  engine?: ChatReply["engine"];
+  completion?: ChatReply["completion"];
+  coaching?: ChatReply["coaching"];
+};
+
 const globalForSessions = globalThis as typeof globalThis & {
   __rizzSessions?: Map<string, RizzSession>;
 };
@@ -50,16 +58,55 @@ const getSession = (matchId: string, profile: RizzProfile) => {
   return created;
 };
 
-const extractBotpressReply = (payload: unknown): string | undefined => {
+const isChatStatus = (value: unknown): value is ChatStatus =>
+  value === "chatting" || value === "unmatched" || value === "won";
+
+const isCoaching = (value: unknown): value is ChatReply["coaching"] => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return typeof record.dateScore === "number" && typeof record.read === "string" && typeof record.nextMove === "string";
+};
+
+const isEngine = (value: unknown): value is ChatReply["engine"] =>
+  value === "botpress-completion" || value === "botpress-action-fallback" || value === "local";
+
+const isCompletion = (value: unknown): value is ChatReply["completion"] => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return typeof record.llmCalls === "number" && typeof record.durationMs === "number";
+};
+
+const extractBotpressReply = (payload: unknown): BotpressResult | undefined => {
   if (!payload || typeof payload !== "object") {
     return undefined;
   }
 
   const record = payload as Record<string, unknown>;
+  const output = record.output;
+
+  if (output && typeof output === "object") {
+    const nested = extractBotpressReply(output);
+    if (nested) {
+      return nested;
+    }
+  }
+
   const direct = record.reply ?? record.text ?? record.message;
 
   if (typeof direct === "string") {
-    return direct;
+    return {
+      text: direct,
+      status: isChatStatus(record.status) ? record.status : undefined,
+      engine: isEngine(record.engine) ? record.engine : undefined,
+      completion: isCompletion(record.completion) ? record.completion : undefined,
+      coaching: isCoaching(record.coaching) ? record.coaching : undefined,
+    };
   }
 
   const messages = record.messages;
@@ -82,14 +129,17 @@ const extractBotpressReply = (payload: unknown): string | undefined => {
       .filter(Boolean);
 
     if (texts.length) {
-      return texts.join("\n");
+      return { text: texts.join("\n") };
     }
   }
 
   return undefined;
 };
 
-const tryBotpress = async (payload: BotpressPayload): Promise<string | undefined> => {
+const getAdkConfigurationHeader = () =>
+  Buffer.from(JSON.stringify({ payload: {} })).toString("base64");
+
+const tryBotpress = async (payload: BotpressPayload): Promise<BotpressResult | undefined> => {
   const endpoint = process.env.BOTPRESS_RIZZBOT_ENDPOINT;
 
   if (!endpoint) {
@@ -100,6 +150,22 @@ const tryBotpress = async (payload: BotpressPayload): Promise<string | undefined
     "Content-Type": "application/json",
   };
 
+  const botId = process.env.BOTPRESS_RIZZBOT_BOT_ID;
+  const actionName = process.env.BOTPRESS_RIZZBOT_ACTION || "rizzbotReply";
+  const body = botId
+    ? {
+        type: actionName,
+        input: payload,
+      }
+    : payload;
+
+  if (botId) {
+    headers["x-bot-id"] = botId;
+    headers["x-bp-operation"] = "action_triggered";
+    headers["x-bp-type"] = "actionTriggered";
+    headers["x-bp-configuration"] = getAdkConfigurationHeader();
+  }
+
   if (process.env.BOTPRESS_RIZZBOT_TOKEN) {
     headers.Authorization = `Bearer ${process.env.BOTPRESS_RIZZBOT_TOKEN}`;
   }
@@ -107,7 +173,7 @@ const tryBotpress = async (payload: BotpressPayload): Promise<string | undefined
   const response = await fetch(endpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -187,6 +253,7 @@ const localReply = (session: RizzSession, userText: string): ChatReply => {
       message: message("match", `UNMATCHED: ${hardStop}.`),
       status: session.status,
       source: "local",
+      engine: "local",
       coaching: {
         dateScore: 0,
         read: "That crossed a boundary instead of building comfort.",
@@ -205,6 +272,7 @@ const localReply = (session: RizzSession, userText: string): ChatReply => {
         message: message("match", `UNMATCHED: ${ick} twice.`),
         status: session.status,
         source: "local",
+        engine: "local",
         coaching: {
           dateScore: 12,
           read: "The chat needs a real hook, not another empty ping.",
@@ -217,6 +285,7 @@ const localReply = (session: RizzSession, userText: string): ChatReply => {
       message: message("match", `${profile.name}: Hmm. Tiny ick, but I will allow one recovery attempt.`),
       status: session.status,
       source: "local",
+      engine: "local",
       coaching: {
         dateScore: 24,
         read: `This was ${ick}.`,
@@ -233,6 +302,7 @@ const localReply = (session: RizzSession, userText: string): ChatReply => {
       message: message("match", `${profile.name}: That is actually a good plan. I would say yes to that.`),
       status: session.status,
       source: "local",
+      engine: "local",
       coaching: {
         dateScore: 92,
         read: "Specific, low-pressure, and timed after some rapport.",
@@ -254,6 +324,7 @@ const localReply = (session: RizzSession, userText: string): ChatReply => {
     message: message("match", replies[session.turns % replies.length]),
     status: session.status,
     source: "local",
+    engine: "local",
     coaching: {
       dateScore: score,
       read: score > 70 ? "Good profile callback with enough momentum." : "Decent start, but it needs a sharper hook.",
@@ -272,25 +343,32 @@ export const getRizzbotReply = async (input: {
   session.messages.push(userMessage);
 
   try {
-    const botpressText = await tryBotpress({
+    const botpress = await tryBotpress({
       matchId: input.matchId,
       profile: session.profile,
       message: input.text,
       history: session.messages,
     });
 
-    if (botpressText) {
-      const botpressReply = message("match", botpressText);
+    if (botpress) {
+      const botpressReply = message("match", botpress.text);
       session.messages.push(botpressReply);
+      const status =
+        botpress.status ??
+        (botpress.text.startsWith("UNMATCHED:")
+          ? "unmatched"
+          : botpress.text.startsWith("WIN:")
+            ? "won"
+            : "chatting");
+      session.status = status;
 
       return {
         message: botpressReply,
-        status: botpressText.startsWith("UNMATCHED:")
-          ? "unmatched"
-          : botpressText.startsWith("WIN:")
-            ? "won"
-            : "chatting",
+        status,
         source: "botpress",
+        engine: botpress.engine,
+        completion: botpress.completion,
+        coaching: botpress.coaching,
       };
     }
   } catch (error) {
