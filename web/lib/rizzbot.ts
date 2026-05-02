@@ -285,7 +285,11 @@ export const getRizzbotReply = async (input: {
 
       return {
         message: botpressReply,
-        status: botpressText.startsWith("UNMATCHED:") ? "unmatched" : "chatting",
+        status: botpressText.startsWith("UNMATCHED:")
+          ? "unmatched"
+          : botpressText.startsWith("WIN:")
+            ? "won"
+            : "chatting",
         source: "botpress",
       };
     }

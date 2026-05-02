@@ -1,24 +1,39 @@
-import { mkdir, readdir, writeFile } from "fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "fs/promises";
 import { extname, join } from "path";
 import type { ProfileImageStatus, RizzProfile } from "./types";
 
 type ImageCacheState = {
-  cursor: number;
+  cursor?: number;
+  cachedProfileCursor: number;
+  imageCursor: number;
+  servedProfileIds: Set<string>;
 };
 
 const globalForImages = globalThis as typeof globalThis & {
   __rizzImageCache?: ImageCacheState;
 };
 
-const imageState = globalForImages.__rizzImageCache ?? { cursor: 0 };
+const imageState =
+  globalForImages.__rizzImageCache ??
+  ({
+    cachedProfileCursor: 0,
+    imageCursor: 0,
+    servedProfileIds: new Set<string>(),
+  } satisfies ImageCacheState);
+
+imageState.imageCursor ??= imageState.cursor ?? 0;
+imageState.cachedProfileCursor ??= 0;
+imageState.servedProfileIds =
+  imageState.servedProfileIds instanceof Set ? imageState.servedProfileIds : new Set<string>();
 globalForImages.__rizzImageCache = imageState;
 
 const imageDir = join(process.cwd(), "public", "generated-profiles");
 const publicPrefix = "/generated-profiles";
 const imageModel = "gpt-image-2";
 const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+const profileMetadataExtension = ".json";
 const configuredTimeoutMs = Number(process.env.OPENAI_IMAGE_TIMEOUT_MS);
-const openAiTimeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? configuredTimeoutMs : 45_000;
+const openAiTimeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? configuredTimeoutMs : 120_000;
 
 const ensureImageDir = async () => {
   await mkdir(imageDir, { recursive: true });
@@ -35,13 +50,17 @@ const listCachedImages = async () => {
     .map((file) => `${publicPrefix}/${file}`);
 };
 
-const getCachedImage = (cachedImages: string[]) => {
+const getCachedImage = (cachedImages: string[], allowReuse = true) => {
   if (!cachedImages.length) {
     return undefined;
   }
 
-  const image = cachedImages[imageState.cursor % cachedImages.length];
-  imageState.cursor += 1;
+  if (!allowReuse && imageState.imageCursor >= cachedImages.length) {
+    return undefined;
+  }
+
+  const image = cachedImages[imageState.imageCursor % cachedImages.length];
+  imageState.imageCursor += 1;
   return image;
 };
 
@@ -70,6 +89,70 @@ const withImage = (profile: Omit<RizzProfile, "imageUrl" | "imageStatus">, image
   imageUrl,
   imageStatus,
 });
+
+const isRizzProfile = (value: unknown): value is RizzProfile => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const profile = value as Partial<RizzProfile>;
+
+  return (
+    typeof profile.id === "string" &&
+    typeof profile.name === "string" &&
+    typeof profile.age === "number" &&
+    typeof profile.headline === "string" &&
+    typeof profile.bio === "string" &&
+    typeof profile.promptLabel === "string" &&
+    typeof profile.promptAnswer === "string" &&
+    Array.isArray(profile.interests) &&
+    typeof profile.voice === "string" &&
+    typeof profile.personality === "string" &&
+    typeof profile.boundary === "string" &&
+    typeof profile.openingLine === "string" &&
+    typeof profile.imagePrompt === "string" &&
+    typeof profile.imageUrl === "string"
+  );
+};
+
+const readCachedProfile = async (fileName: string): Promise<RizzProfile | undefined> => {
+  try {
+    const content = await readFile(join(imageDir, fileName), "utf8");
+    const profile = JSON.parse(content) as unknown;
+
+    if (!isRizzProfile(profile)) {
+      return undefined;
+    }
+
+    return {
+      ...profile,
+      imageStatus: "cached",
+    };
+  } catch {
+    return undefined;
+  }
+};
+
+const saveProfileMetadata = async (profile: RizzProfile) => {
+  await writeFile(join(imageDir, `${profile.id}${profileMetadataExtension}`), JSON.stringify(profile, null, 2));
+  imageState.servedProfileIds.add(profile.id);
+};
+
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException
+    ? error.name === "AbortError"
+    : typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      (error as { name?: unknown }).name === "AbortError";
+
+const getErrorMessage = (error: unknown) => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+};
 
 const generateProfileImage = async (
   profile: Omit<RizzProfile, "imageUrl" | "imageStatus">
@@ -112,7 +195,69 @@ const generateProfileImage = async (
   const fileName = `${profile.id}.jpg`;
   await writeFile(join(imageDir, fileName), Buffer.from(imageBase64, "base64"));
 
-  return withImage(profile, `${publicPrefix}/${fileName}`, "generated");
+  const profileWithImage = withImage(profile, `${publicPrefix}/${fileName}`, "generated");
+  await saveProfileMetadata(profileWithImage);
+
+  return profileWithImage;
+};
+
+export const takeCachedGeneratedProfiles = async (count: number, options?: { allowReuse?: boolean }) => {
+  await ensureImageDir();
+
+  const allowReuse = options?.allowReuse ?? false;
+  const files = (await readdir(imageDir)).filter((file) => extname(file).toLowerCase() === profileMetadataExtension).sort();
+
+  if (!files.length || count <= 0) {
+    return [];
+  }
+
+  const availableFiles = allowReuse
+    ? files
+    : files.filter((file) => !imageState.servedProfileIds.has(file.slice(0, -profileMetadataExtension.length)));
+
+  const selectedFiles: string[] = [];
+
+  if (allowReuse) {
+    for (let index = 0; index < count && files.length; index += 1) {
+      selectedFiles.push(files[imageState.cachedProfileCursor % files.length]);
+      imageState.cachedProfileCursor += 1;
+    }
+  } else {
+    selectedFiles.push(...availableFiles.slice(0, count));
+  }
+
+  const cachedProfiles = (await Promise.all(selectedFiles.map(readCachedProfile))).filter((profile): profile is RizzProfile =>
+    Boolean(profile)
+  );
+
+  cachedProfiles.forEach((profile) => imageState.servedProfileIds.add(profile.id));
+
+  return cachedProfiles;
+};
+
+export const attachCachedImages = async (
+  profiles: Array<Omit<RizzProfile, "imageUrl" | "imageStatus">>,
+  options?: { allowReuse?: boolean; excludeImageUrls?: string[] }
+) => {
+  const excludedImages = new Set(options?.excludeImageUrls ?? []);
+  const cachedImages = (await listCachedImages()).filter((image) => !excludedImages.has(image));
+  const profilesWithCachedImages: RizzProfile[] = [];
+  const remainingProfiles: Array<Omit<RizzProfile, "imageUrl" | "imageStatus">> = [];
+
+  for (const profile of profiles) {
+    const cachedImage = getCachedImage(cachedImages, options?.allowReuse ?? true);
+
+    if (cachedImage) {
+      profilesWithCachedImages.push(withImage(profile, cachedImage, "cached"));
+    } else {
+      remainingProfiles.push(profile);
+    }
+  }
+
+  return {
+    profiles: profilesWithCachedImages,
+    remainingProfiles,
+  };
 };
 
 export const attachGeneratedImages = async (
@@ -130,7 +275,14 @@ export const attachGeneratedImages = async (
       try {
         return await generateProfileImage(profile);
       } catch (error) {
-        console.error(error);
+        if (isAbortError(error)) {
+          console.warn(
+            `gpt-image-2 timed out after ${Math.round(openAiTimeoutMs / 1000)}s for ${profile.id}; using a cached or fallback image.`
+          );
+        } else {
+          console.warn(`gpt-image-2 failed for ${profile.id}: ${getErrorMessage(error)}; using a cached or fallback image.`);
+        }
+
         const cachedImage = getCachedImage(cachedImages);
         return withImage(profile, cachedImage ?? fallbackAvatar(profile), cachedImage ? "cached" : "fallback");
       }
