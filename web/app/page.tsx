@@ -47,6 +47,7 @@ export default function Home() {
   const [streak, setStreak] = useState(0);
   const [bestStreak, setBestStreak] = useState(0);
   const pendingBatch = useRef(false);
+  const messageListRef = useRef<HTMLDivElement>(null);
   const topProfile = deck[0];
 
   const requestBatch = useCallback(async () => {
@@ -80,6 +81,18 @@ export default function Home() {
       void requestBatch();
     }
   }, [deck.length, requestBatch]);
+
+  useEffect(() => {
+    const messageList = messageListRef.current;
+    if (!messageList) {
+      return;
+    }
+
+    messageList.scrollTo({
+      top: messageList.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [activeMatch?.id, activeMatch?.messages.length, sending]);
 
   const startMatch = (profile: RizzProfile) => {
     setActiveMatch({
@@ -364,12 +377,19 @@ export default function Home() {
             )}
           </div>
 
-          <div className="message-list">
+          <div className="message-list" ref={messageListRef}>
             {(activeMatch?.messages ?? []).map((chatMessage) => (
               <div className={`message ${chatMessage.role}`} key={chatMessage.id}>
                 {chatMessage.content}
               </div>
             ))}
+            {activeMatch && sending && (
+              <div className="message match typing-message" aria-label={`${activeMatch.profile.name} is typing`}>
+                <span className="typing-dot" aria-hidden="true" />
+                <span className="typing-dot" aria-hidden="true" />
+                <span className="typing-dot" aria-hidden="true" />
+              </div>
+            )}
           </div>
 
           {activeMatch?.coaching && (
